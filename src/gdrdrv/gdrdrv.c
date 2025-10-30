@@ -160,6 +160,111 @@ static inline void vm_flags_set(struct vm_area_struct *vma, vm_flags_t flags)
 }
 #endif
 
+/*<gesalous>*/
+/* One record per contiguous range returned by nvidia_p2p_get_pages* */
+struct gdr_gpu_mapping {
+        struct list_head node;
+        u64  gpu_va;        /* page-aligned GPU virtual address                  */
+        u64  cpu_va;
+        u64  length;        /* in bytes, page-aligned                            */
+        // u64  bar_pfn;       /* 1st PFN inside the BAR window                     */
+        // u32  bar_index;     /* Which PCI BAR (0..5) the PFN belongs to           */
+        pid_t tgid;         /* creator (helps with debugging / isolation)        */
+};
+
+static LIST_HEAD(gdr_gpu_mapping_list);
+static DEFINE_MUTEX(gdr_gpu_mapping_lock);
+
+#include <linux/pci.h>
+#include <linux/pci_ids.h>   /* for PCI_VENDOR_ID_NVIDIA */
+
+// static struct pci_dev *gdr_find_first_nvidia_gpu(void)
+// {
+//         struct pci_dev *pdev = NULL;
+
+//         /*
+//          * Walk the device list until we encounter a NVIDIA device whose
+//          * class code corresponds to VGA, 3-D controller or coprocessor.
+//          * The class codes are defined in <uapi/linux/pci_regs.h>.
+//          */
+//         while ((pdev = pci_get_device(PCI_VENDOR_ID_NVIDIA,
+//                                       PCI_ANY_ID,
+//                                       pdev))) {
+
+//                 unsigned int base_class = pdev->class >> 8;
+
+//                 if (base_class == PCI_CLASS_DISPLAY_VGA        ||
+//                     base_class == PCI_CLASS_DISPLAY_3D         ||
+//                     base_class == PCI_CLASS_PROCESSOR_CO) {
+
+//                         /* Reference already incremented by pci_get_device()   */
+//                         return pdev;      /* caller must later pci_dev_put()   */
+//                 }
+
+//                 /*
+//                  * Not a GPU we care about – drop the reference we just gained
+//                  * and keep looking.
+//                  */
+//                 pci_dev_put(pdev);
+//         }
+
+//         /* No suitable GPU present.  NULL signals the failure. */
+//         return NULL;
+// }
+//Staff for /proc gpumap
+static void *gpumap_start(struct seq_file *s, loff_t *pos)
+{
+        mutex_lock(&gdr_gpu_mapping_lock);
+        return seq_list_start(&gdr_gpu_mapping_list, *pos);
+}
+static void *gpumap_next(struct seq_file *s, void *v, loff_t *pos)
+{
+        return seq_list_next(v, &gdr_gpu_mapping_list, pos);
+}
+static void gpumap_stop(struct seq_file *s, void *v)
+{
+        mutex_unlock(&gdr_gpu_mapping_lock);
+}
+static int gpumap_show(struct seq_file *s, void *v)
+{
+        const struct gdr_gpu_mapping *gm =
+                list_entry(v, struct gdr_gpu_mapping, node);
+
+        seq_printf(s,
+                   "tgid=%d cpu_va=0x%012llx gpu_va=0x%012llx len=%llu\n",
+                   gm->tgid,
+                   gm->cpu_va,
+                   gm->gpu_va,
+                   gm->length);
+        return 0;
+}
+static const struct seq_operations gpumap_seq_ops = {
+        .start = gpumap_start,
+        .next  = gpumap_next,
+        .stop  = gpumap_stop,
+        .show  = gpumap_show,
+};
+#ifdef GDRDRV_HAVE_PROC_OPS
+static int gpumap_open(struct inode *inode, struct file *file)
+{
+        return seq_open(file, &gpumap_seq_ops);
+}
+static const struct proc_ops gdrdrv_proc_gpumap_proc_ops = {
+        .proc_open    = gpumap_open,
+        .proc_read    = seq_read,
+        .proc_lseek   = seq_lseek,
+        .proc_release = seq_release,
+};
+#else
+/* kernels < 5.6 */
+static const struct file_operations gdrdrv_proc_gpumap_proc_ops = {
+        .open    = gpumap_open,
+        .read    = seq_read,
+        .llseek  = seq_lseek,
+        .release = seq_release,
+};
+#endif
+/*</gesalous>*/
 
 #if defined(CONFIG_X86_64) || defined(CONFIG_X86_32)
 static inline pgprot_t pgprot_modify_writecombine(pgprot_t old_prot)
@@ -206,7 +311,7 @@ static inline bool gdr_pfn_is_ram(unsigned long pfn)
     return page_is_ram(pfn);
 #else
     // For the proprietary flavor, we approximate using the following algorithm.
-    unsigned long start = pfn << PAGE_SHIFT;
+    unsigned long start = pfn << GPU_PAGE_SHIFT;
     unsigned long mask_47bits = (1UL<<47)-1;
     return gdrdrv_cpu_could_cache_gpu_mappings && (0 == (start & ~mask_47bits));
 #endif
@@ -327,7 +432,6 @@ static int info_enabled = 0;
 static int use_persistent_mapping = 1;
 
 static struct proc_dir_entry *gdrdrv_proc_dir_entry = NULL;
-
 //-----------------------------------------------------------------------------
 
 MODULE_AUTHOR("drossetti@nvidia.com");
@@ -794,7 +898,21 @@ static inline int gdr_generate_mr_handle(gdr_info_t *info, gdr_mr_t *mr)
 }
 
 //-----------------------------------------------------------------------------
-
+/*<gesalous>*/
+//Small helper functions
+// static u32 pci_find_bar_index(u64 pfn)
+// {
+//     struct pci_dev *pdev = gdr_find_first_nvidia_gpu();
+//     int i;
+//     for (i = 0; i < DEVICE_COUNT_RESOURCE; ++i) {
+//             resource_size_t start = pci_resource_start(pdev, i) >> PAGE_SHIFT;
+//             resource_size_t end   = pci_resource_end  (pdev, i) >> PAGE_SHIFT;
+//             if (pfn >= start && pfn <= end)
+//                     return i;
+//     }
+//     return 0xffffffff; /* unknown */
+// }
+/*</gesalous>*/
 static int __gdrdrv_pin_buffer(gdr_info_t *info, u64 addr, u64 size, u64 p2p_token, u32 va_space, u32 flags, gdr_hnd_t *p_handle)
 {
     int ret = 0;
@@ -956,6 +1074,21 @@ static int __gdrdrv_pin_buffer(gdr_info_t *info, u64 addr, u64 size, u64 p2p_tok
     }
 
     if (!ret) {
+        /*<gesalous>*/
+        // struct gdr_gpu_mapping *gm = kzalloc(sizeof(*gm), GFP_KERNEL);
+        // if (!gm) return -ENOMEM;
+
+        // gm->gpu_va   = mr->va;
+        // gm->length   = mr->mapped_size;
+        // gm->bar_pfn  = mr->page_table->pages[0]->physical_address >> ilog2(mr->page_size);
+        // gm->bar_index = pci_find_bar_index(gm->bar_pfn); /* helper – see below */
+        // gm->tgid     = task_tgid_nr(current);
+        // gdr_err("GESALOUSTRA: So mr va: %llu page size: %u\n",mr->va,  mr->page_size);
+
+        // mutex_lock(&gdr_gpu_mapping_lock);
+        // list_add_tail(&gm->node, &gdr_gpu_mapping_list);
+        // mutex_unlock(&gdr_gpu_mapping_lock);
+        /*</gesalous>*/
         list_add(&mr->node, &info->mr_list);
         *p_handle = mr->handle;
         up_write(&mr->sem);
@@ -1709,6 +1842,18 @@ static int gdrdrv_mmap(struct file *filp, struct vm_area_struct *vma)
             gdr_err("error %d in gdrdrv_remap_gpu_mem\n", ret);
             goto out;
         }
+        /*<gesalous>*/
+        struct gdr_gpu_mapping *gm = kzalloc(sizeof(*gm), GFP_KERNEL);
+        if (!gm) return -ENOMEM;
+        gm->cpu_va  = vaddr;
+        gm->gpu_va   = paddr;
+        gm->length   = len;
+        gm->tgid     = task_tgid_nr(current);
+        gdr_err("GESALOUSTRA: tgid: %d cpu addr: %llu gpu bar: %llu addr len: %llu\n",gm->tgid,gm->cpu_va,gm->gpu_va, gm->length);
+        mutex_lock(&gdr_gpu_mapping_lock);
+        list_add_tail(&gm->node, &gdr_gpu_mapping_list);
+        mutex_unlock(&gdr_gpu_mapping_lock);
+        /*</gesalous>*/
         vaddr += len;
         size -= len;
         offset = 0;
@@ -1846,6 +1991,9 @@ static int gdrdrv_procfs_init(void)
             goto out;
         }
     }
+    /*<gesalous>*/
+    entry = proc_create("gpumap",(S_IFREG | S_IRUGO),gdrdrv_proc_dir_entry,&gdrdrv_proc_gpumap_proc_ops);
+    /*</gesalous>*/
 
 out:
     if (status) {
